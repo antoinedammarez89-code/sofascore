@@ -61,11 +61,19 @@ async def get_matches(context):
     url = f"https://www.sofascore.com/api/v1/sport/football/scheduled-events/{DATE}"
 
     page = await context.new_page()
-    await page.goto(url)
-    text = await page.content()
-    print(text[:1000])
+    response = await page.goto(url)
+
+    text = await response.text()
+
     await page.close()
-    return []
+
+    try:
+        data = json.loads(text)
+        return data.get("events", [])
+    except Exception as e:
+        print("❌ JSON parse error:", e)
+        print(text[:500])
+        return []
     
 def translate_status(status_str):
     status = (status_str or "").lower()
