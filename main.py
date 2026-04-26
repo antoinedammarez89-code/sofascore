@@ -466,8 +466,10 @@ async def process(context):
 def send_to_sheets(df):
     SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
-    creds = Credentials.from_service_account_file(
-        "credentials.json",  # ton fichier téléchargé
+    creds_dict = json.loads(os.environ["GOOGLE_CREDENTIALS"])
+
+    creds = Credentials.from_service_account_info(
+        creds_dict,
         scopes=SCOPES
     )
 
