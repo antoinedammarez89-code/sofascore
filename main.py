@@ -59,21 +59,13 @@ async def fetch_json(context, url):
 
 async def get_matches(context):
     url = f"https://www.sofascore.com/api/v1/sport/football/scheduled-events/{DATE}"
-
-    page = await context.new_page()
-    response = await page.goto(url)
-
-    text = await response.text()
-
-    await page.close()
-
-    try:
-        data = json.loads(text)
-        return data.get("events", [])
-    except Exception as e:
-        print("❌ JSON parse error:", e)
-        print(text[:500])
-        return []
+    log("API", f"🔎 FETCH MATCHES URL = {url}")
+    data = await fetch_json(context, url)
+    events = data.get("events", [])
+    log("API", f"📦 EVENTS RECEIVED = {len(events)}")
+    if len(events) == 0:
+        log("API", "⚠️ LISTE VIDE → problème endpoint ou filtre DATE")
+    return data.get("events", []) if data else []
     
 def translate_status(status_str):
     status = (status_str or "").lower()
