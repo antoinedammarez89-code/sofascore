@@ -5,6 +5,7 @@ from playwright.async_api import async_playwright
 from datetime import timezone
 import gspread
 from google.oauth2.service_account import Credentials
+import json
 
 #DATE = "2026-04-25"  # ← modifie ici
 DATE = datetime.now().strftime("%Y-%m-%d")  # auto (désactivé)
