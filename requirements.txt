@@ -2,3 +2,8 @@ requests
 gspread
 google-auth
 pytz
+pandas
+playwright
+gspread
+google-auth-oauthlib
+google-auth-httplib2

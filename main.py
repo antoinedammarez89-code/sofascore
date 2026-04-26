@@ -1,285 +1,514 @@
-import requests
-import time
-import random
+import asyncio
+import pandas as pd
 from datetime import datetime
-import pytz
+from playwright.async_api import async_playwright
+from datetime import timezone
 import gspread
 from google.oauth2.service_account import Credentials
 
-# ========================
-# CONFIG
-# ========================
+#DATE = "2026-04-25"  # ← modifie ici
+DATE = datetime.now().strftime("%Y-%m-%d")  # auto (désactivé)
+LOG_FILE = f"logs_{DATE}.txt"
 
-BASE_URL = "https://www.sofascore.com/api/v1"
-TIMEZONE = "Europe/Paris"
+def log(match_id, text):
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(f"{match_id} - {text}\n")
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8"
-}
+def exclude(home, away, reason, extra=None):
+    match_name = f"{home} vs {away}"
 
-session = requests.Session()
+    if extra:
+        log(match_name, f"❌ EXCLU : {reason} | {extra}")
+    else:
+        log(match_name, f"❌ EXCLU : {reason}")     
+
 
 standings_cache = {}
 history_cache = {}
 
-# ========================
-# GOOGLE SHEETS
-# ========================
+# =========================
+# COMPETITIONS AUTORISÉES
+# =========================
 
-def connect_sheet():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    creds = Credentials.from_service_account_file("credentials.json", scopes=scopes)
-    client = gspread.authorize(creds)
+ALLOWED = {
+    17,18,24,25,20,22,34,182,39,47,40,46,188,675,187,325,
+    170,45,172,41,55,36,211,212,215,242,35,44,23,53,8,54,
+    38,9,136,37,131,238,239,52,202,155,192,196,402,185,
+    152,247,218,178,649,782,254,210,197,410,808,955,358,1032
+}
 
-    return client.open_by_key("1a1iQ8Rq6wa3ECm84hVfVpIcoorgsCkiT5up06bk7gyw")
+# =========================
+# FETCH UTIL (via browser)
+# =========================
 
-# ========================
-# UTILS
-# ========================
-
-def sleep():
-    time.sleep(0.8 + random.random() * 0.4)
-
-def fetch(url, headers=None, retry=2):
-    sleep()
+async def fetch_json(context, url):
+    page = await context.new_page()
     try:
-        res = session.get(url, headers=headers or HEADERS)
-
-        if res.status_code != 200:
-            if retry > 0:
-                time.sleep(0.5)
-                return fetch(url, headers, retry - 1)
-            print(f"❌ {res.status_code} {url}")
-            return None
-
-        return res.json()
-    except Exception as e:
-        print("Erreur:", e)
+        await page.goto(url, wait_until="domcontentloaded")
+        data = await page.evaluate("() => fetch(location.href).then(r => r.json())")
+        return data
+    except:
         return None
+    finally:
+        await page.close()
 
-# ========================
-# COMPETITIONS
-# ========================
+# =========================
+# API CALLS
+# =========================
 
-def get_checked_competitions(sheet):
-    ws = sheet.worksheet("Export Competition")
-    data = ws.get_all_values()[1:]
+async def get_matches(context):
+    url = f"https://www.sofascore.com/api/v1/sport/football/scheduled-events/{DATE}"
+    data = await fetch_json(context, url)
+    return data.get("events", []) if data else []
 
-    checked = {}
+def translate_status(status_str):
+    status = (status_str or "").lower()
 
-    for row in data:
-        try:
-            comp_id = int(row[2])
-            is_checked = row[4].lower() == "true"
+    mapping = {
+        "not started": "Non démarré",
+        "scheduled": "Programmé",
+        "1st half": "1ère mi-temps",
+        "2nd half": "2ème mi-temps",
+        "halftime": "Mi-temps",
+        "finished": "Fini",
+        "ended": "Fini",
+        "postponed": "Reporté",
+        "cancelled": "Annulé",
+        "abandoned": "Annulé"
+    }
 
-            if is_checked:
-                checked[comp_id] = True
-        except:
-            continue
+    for key in mapping:
+        if key in status:
+            return mapping[key]
 
-    return checked
+    return status
 
-# ========================
-# STANDINGS
-# ========================
+async def get_standings(context, comp_id, season_id):
 
-def get_standings(comp_id, season_id):
     key = f"{comp_id}_{season_id}"
     if key in standings_cache:
         return standings_cache[key]
 
-    urls = [
-        f"{BASE_URL}/unique-tournament/{comp_id}/season/{season_id}/standings/total",
-        f"{BASE_URL}/unique-tournament/{comp_id}/season/{season_id}/standings"
-    ]
+    url = f"https://www.sofascore.com/api/v1/unique-tournament/{comp_id}/season/{season_id}/standings/total"
+    data = await fetch_json(context, url)
 
-    for url in urls:
-        data = fetch(url)
-        if not data or "standings" not in data:
-            continue
+    if not data:
+        return {}
 
-        standings = {}
-        groups = data["standings"]
-        selected = [groups[0]] if len(groups) > 1 else groups
+    groups = data.get("standings", [])
 
-        for group in selected:
-            for row in group.get("rows", []):
-                team = row.get("team")
-                if team:
-                    standings[team["id"]] = {
-                        "position": row["position"],
-                        "points": row["points"]
-                    }
+    # 🔥 IDENTIQUE APP SCRIPT
+    selected_groups = groups
+    
+    standings = {}
 
-        standings_cache[key] = standings
-        return standings
+    for group in selected_groups:
+        rows = group.get("rows", [])
 
-    return {}
+        for r in rows:
+            team = r.get("team")
+            team_id = team.get("id")
+            
+            if not team or not team_id:
+                exclude("STANDINGS", "team invalide ou id manquant")
+                continue
+            
+            if team and team.get("id"):
+                standings[team_id] = {
+                    "position": r.get("position"),
+                    "points": r.get("points"),
+                    "group": group.get("name")
+                }    
+            
+            # ✅ LOG ICI (quand tout est OK)
+            log(
+                "STANDINGS",
+                f"✔ {team.get('name')} | "
+                f"pos={r.get('position')} | "
+                f"pts={r.get('points')} | "
+                f"group={group.get('name')} | "
+            )
 
-# ========================
-# HISTORY
-# ========================
+    standings_cache[key] = standings
+    return standings
 
-def get_team_history(team_id, tournament_id, season_id):
-    key = f"{team_id}_{tournament_id}"
 
+async def get_history(context, team_id, comp_id, season_id):
+
+    key = f"{team_id}_{comp_id}_{season_id}"
     if key in history_cache:
         return history_cache[key]
 
-    url = f"{BASE_URL}/team/{team_id}/unique-tournament/{tournament_id}/events/last/0"
-    data = fetch(url)
+    url = f"https://www.sofascore.com/api/v1/team/{team_id}/unique-tournament/{comp_id}/events/last/0"
+    data = await fetch_json(context, url)
 
-    if not data:
-        history_cache[key] = []
-        return []
+    events = data.get("events", []) if data else []
 
+    # 🔥 FILTRE IMPORTANT : même saison uniquement
     events = [
-        e for e in data.get("events", [])
+        e for e in events
         if e.get("season", {}).get("id") == season_id
     ]
 
     history_cache[key] = events
     return events
 
-# ========================
-# ANALYSE MATCH
-# ========================
 
-def analyze_match(event, checked):
-    status = (event.get("status", {}).get("description", "")).lower()
+async def get_possession(context, match_id, is_home):
 
-    if "postponed" in status or "canceled" in status:
+    url = f"https://www.sofascore.com/api/v1/event/{match_id}/statistics"
+    data = await fetch_json(context, url)
+
+    if not data:
         return None
 
-    comp_id = event["tournament"]["uniqueTournament"]["id"]
+    for stat in data.get("statistics", []):
+        for g in stat.get("groups", []):
+            for item in g.get("statisticsItems", []):
+                if item.get("name", "").lower() == "ball possession":
+                    return item["homeValue"] if is_home else item["awayValue"]
 
-    if not checked.get(comp_id):
+    return None
+
+async def get_season_id(context, comp_id):
+    url = f"https://www.sofascore.com/api/v1/unique-tournament/{comp_id}/seasons"
+    data = await fetch_json(context, url)
+
+    if not data:
         return None
 
-    season_id = event["season"]["id"]
-
-    standings = get_standings(comp_id, season_id)
-
-    home = event["homeTeam"]
-    away = event["awayTeam"]
-
-    home_id = home["id"]
-    away_id = away["id"]
-
-    home_rank = standings.get(home_id, {}).get("position")
-    away_rank = standings.get(away_id, {}).get("position")
-
-    if not home_rank or not away_rank:
+    seasons = data.get("seasons", [])
+    if not seasons:
         return None
 
-    best_rank = min(home_rank, away_rank)
+    active = next((s for s in seasons if s.get("active")), None)
+    return (active or seasons[0]).get("id")
+    
+    
+# =========================
+# LOGIQUE IDENTIQUE APP SCRIPT
+# =========================
 
-    if best_rank > 8:
-        return None
+async def process(context):
 
-    if abs(home_rank - away_rank) < 4:
-        return None
-
-    home_pts = standings.get(home_id, {}).get("points", 0)
-    away_pts = standings.get(away_id, {}).get("points", 0)
-
-    if abs(home_pts - away_pts) < 7:
-        return None
-
-    best_team = home_id if home_rank < away_rank else away_id
-
-    history = get_team_history(best_team, comp_id, season_id)
-
-    if len(history) < 4:
-        return None
-
-    sorted_matches = sorted(history, key=lambda x: x["startTimestamp"], reverse=True)
-
-    # LAST 2
-    losses_last2 = 0
-    for m in sorted_matches[:2]:
-        is_home = m["homeTeam"]["id"] == best_team
-        if (is_home and m["winnerCode"] == 2) or (not is_home and m["winnerCode"] == 1):
-            losses_last2 += 1
-
-    if losses_last2 == 2:
-        return None
-
-    # LAST 5
-    losses5 = 0
-    for m in sorted_matches[:5]:
-        is_home = m["homeTeam"]["id"] == best_team
-        if (is_home and m["winnerCode"] == 2) or (not is_home and m["winnerCode"] == 1):
-            losses5 += 1
-
-    if losses5 > 2:
-        return None
-
-    # LAST 20
-    wins = 0
-    losses = 0
-
-    for m in sorted_matches[:20]:
-        is_home = m["homeTeam"]["id"] == best_team
-
-        if (is_home and m["winnerCode"] == 1) or (not is_home and m["winnerCode"] == 2):
-            wins += 1
-        elif (is_home and m["winnerCode"] == 2) or (not is_home and m["winnerCode"] == 1):
-            losses += 1
-
-    if losses > wins:
-        return None
-
-    return {
-        "competition": event["tournament"]["name"],
-        "home": home["name"],
-        "away": away["name"],
-        "layDraw": "Oui"
-    }
-
-# ========================
-# WRITE SHEET
-# ========================
-
-def write_sheet(sheet, matches):
-    ws = sheet.worksheet("MATCHS")
-
-    ws.clear()
-
-    headers = ["Compétition", "Domicile", "Extérieur", "Lay Draw"]
-    ws.append_row(headers)
+    matches = await get_matches(context)
+    results = []
 
     for m in matches:
-        ws.append_row([
-            m["competition"],
-            m["home"],
-            m["away"],
-            m["layDraw"]
-        ])
+        
+        start_ts = m.get("startTimestamp")
 
-# ========================
-# MAIN
-# ========================
+        if not start_ts:
+            exclude(m.get("homeTeam", {}).get("name", "HOME?"),
+            m.get("awayTeam", {}).get("name", "AWAY?"), "startTimestamp manquant")
+            continue
 
-def main():
-    tz = pytz.timezone(TIMEZONE)
-    today = datetime.now(tz).strftime("%Y-%m-%d")
+        match_date = datetime.fromtimestamp(start_ts, tz=timezone.utc).strftime("%Y-%m-%d")
 
-    sheet = connect_sheet()
-    checked = get_checked_competitions(sheet)
+        if match_date != DATE:
+            continue
+        comp = m.get("tournament", {})
+        comp_id = m.get("tournament", {}).get("uniqueTournament", {}).get("id")
+        
+        competition_name = (comp.get("name") or "").lower()
 
-    data = fetch(f"{BASE_URL}/sport/football/scheduled-events/{today}")
+        if "relegation" in competition_name or "playout" in competition_name or "Qualifying" in competition_name:
+            exclude(m.get("homeTeam", {}).get("name", "HOME?"),
+            m.get("awayTeam", {}).get("name", "AWAY?"), f"compétition exclue (relegation/playout: {competition_name})")
+            continue
 
-    matches = []
+        if "round" in competition_name:
+            exclude(m.get("homeTeam", {}).get("name", "HOME?"),
+            m.get("awayTeam", {}).get("name", "AWAY?"), f"compétition round non autorisée ({competition_name})")
+            continue
 
-    for event in data.get("events", []):
-        res = analyze_match(event, checked)
-        if res:
-            matches.append(res)
+        if comp_id not in ALLOWED:
+            exclude(m.get("homeTeam", {}).get("name", "HOME?"),
+            m.get("awayTeam", {}).get("name", "AWAY?"), f"compétition non autorisée (id={comp_id})")
+            continue
 
-    write_sheet(sheet, matches)
+        status = (m.get("status", {}).get("description") or "").lower()
+        if "postponed" in status or "canceled" in status:
+            exclude(m.get("homeTeam", {}).get("name", "HOME?"),
+            m.get("awayTeam", {}).get("name", "AWAY?"), f"match annulé ou reporté ({status})")
+            continue
 
-if __name__ == "__main__":
-    main()
+        home = m.get("homeTeam", {})
+        away = m.get("awayTeam", {})
+
+        home_id = home.get("id")
+        away_id = away.get("id")
+
+        season_id = m.get("season", {}).get("id")
+        if not season_id:
+            season_id = await get_season_id(context, comp_id)
+
+        if not season_id:
+            exclude(m.get("homeTeam", {}).get("name", "HOME?"),
+            m.get("awayTeam", {}).get("name", "AWAY?"), "season_id manquant (impossible de récupérer la saison)")
+            continue
+
+        standings = await get_standings(context, comp_id, season_id)
+
+        home_rank = standings.get(home_id, {}).get("position")
+        away_rank = standings.get(away_id, {}).get("position")
+
+        home_points = standings.get(home_id, {}).get("points")
+        away_points = standings.get(away_id, {}).get("points")
+
+        if not home_rank or not away_rank:
+            exclude(m.get("homeTeam", {}).get("name", "HOME?"),
+            m.get("awayTeam", {}).get("name", "AWAY?"), "rank manquant (home ou away)")
+            continue
+
+        best_rank = min(home_rank, away_rank)
+
+        if best_rank > 8:
+            exclude(m.get("homeTeam", {}).get("name", "HOME?"),
+            m.get("awayTeam", {}).get("name", "AWAY?"), f"rang trop faible (best_rank={best_rank} > 8)")
+            continue
+
+        if abs(home_rank - away_rank) < 4:
+            exclude(
+                m.get("homeTeam", {}).get("name", "HOME?"),
+                m.get("awayTeam", {}).get("name", "AWAY?"),
+                "écart de ranking insuffisant (<4)",
+                extra=f"home={home_rank} away={away_rank}"
+            )
+            continue
+
+        if abs(home_points - away_points) < 7:
+            exclude(
+                m.get("homeTeam", {}).get("name", "HOME?"),
+                m.get("awayTeam", {}).get("name", "AWAY?"),
+                "écart de points insuffisant (<7)",
+                extra=f"home={home_points} away={away_points}"
+            )
+            continue
+
+        best_team = home_id if home_rank < away_rank else away_id
+        is_best_home = best_team == home_id
+
+        history = await get_history(context, best_team, comp_id, season_id)
+
+        clean = [
+            h for h in history
+            if h.get("homeTeam")
+            and h.get("awayTeam")
+            and h.get("winnerCode") in [1, 2, 3]
+            and (h.get("status", {}).get("type", "").lower() == "finished")
+        ]
+
+        clean.sort(key=lambda x: x["startTimestamp"], reverse=True)
+
+        if len(clean) < 4:
+            exclude(
+            m.get("homeTeam", {}).get("name", "HOME?"),
+            m.get("awayTeam", {}).get("name", "AWAY?"),
+            "pas assez de matchs historiques",
+            extra=f"clean={len(clean)}"
+        )
+            continue
+
+        # ❌ last 2 défaites consécutives
+        last2 = clean[:2]
+        if sum(
+            1 for h in last2
+            if (h["homeTeam"]["id"] == best_team and h["winnerCode"] == 2) or
+               (h["awayTeam"]["id"] == best_team and h["winnerCode"] == 1)
+        ) == 2:
+            continue
+
+        last20 = clean[:20]
+
+        
+# =========================
+# LOGIQUE DOMICILE / EXTÉRIEUR (comme App Script)
+# =========================
+
+        home_wins = 0
+        home_losses = 0
+        away_wins = 0
+        away_losses = 0
+
+        for h in last20:
+
+            is_home_match = h["homeTeam"]["id"] == best_team
+
+            wc = h.get("winnerCode")
+            if wc is None or wc == 3:
+                continue
+
+            win = (is_home_match and wc == 1) or (not is_home_match and wc == 2)
+            loss = (is_home_match and wc == 2) or (not is_home_match and wc == 1)
+
+            if is_home_match:
+                if win:
+                    home_wins += 1
+                if loss:
+                    home_losses += 1
+            else:
+                if win:
+                    away_wins += 1
+                if loss:
+                    away_losses += 1
+
+# =========================
+# FILTRE IDENTIQUE APP SCRIPT
+# =========================
+
+        if is_best_home:
+            if home_wins <= home_losses:
+                exclude(
+                    m.get("homeTeam", {}).get("name", "HOME?"),
+                    m.get("awayTeam", {}).get("name", "AWAY?"),
+                    "forme domicile insuffisante (home wins <= losses)",
+                    extra=f"{home_wins}W - {home_losses}L"
+                )
+                continue
+            else:
+                if away_wins <= away_losses:
+                    exclude(
+                        m.get("homeTeam", {}).get("name", "HOME?"),
+                        m.get("awayTeam", {}).get("name", "AWAY?"),
+                        "forme extérieur insuffisante (away wins <= losses)",
+                        extra=f"{away_wins}W - {away_losses}L"
+                    )
+                    continue
+
+        # last 5 défaites
+        last5 = clean[:5]
+        if sum(
+            1 for h in last5
+            if (h["homeTeam"]["id"] == best_team and h["winnerCode"] == 2) or
+               (h["awayTeam"]["id"] == best_team and h["winnerCode"] == 1)
+        ) > 2:
+            exclude(
+                m.get("homeTeam", {}).get("name", "HOME?"),
+                m.get("awayTeam", {}).get("name", "AWAY?"),
+                "trop de défaites sur les 5 derniers matchs"
+            )
+            continue
+
+        # draws + possession
+        draw_matches = []
+
+        for h in last20:
+            if h.get("winnerCode") != 3:
+                continue
+
+            is_home_match = h["homeTeam"]["id"] == best_team
+
+            # ✅ même logique que App Script (domicile / extérieur du favori)
+            if is_best_home and is_home_match:
+                draw_matches.append(h)
+            elif not is_best_home and not is_home_match:
+                draw_matches.append(h)
+
+        high_pos = 0
+
+        for d in draw_matches:
+            is_fav_home = d["homeTeam"]["id"] == best_team
+            poss = await get_possession(context, d["id"], is_fav_home)
+
+            if poss is None:
+                exclude(
+                    m.get("homeTeam", {}).get("name", "HOME?"),
+                    m.get("awayTeam", {}).get("name", "AWAY?"),
+                    "possession manquante (API)",
+                    extra=f"match={d.get('id')}"
+                )
+                continue
+
+            if poss >= 55:
+                high_pos += 1
+
+        # ✅ logique identique App Script
+        if len(draw_matches) == 0 or high_pos == 0:
+            lay_draw = True
+        elif high_pos >= 2:
+            lay_draw = False
+        else:
+            lay_draw = True
+        
+        # 🕒 Date du match
+        start_ts = m.get("startTimestamp")
+
+        if start_ts:
+            dt = datetime.fromtimestamp(start_ts)
+            start_date = dt.strftime("%Y-%m-%d %H:%M")
+        else:
+            start_date = ""
+
+        status_raw = m.get("status", {}).get("description", "")
+        status = translate_status(status_raw)
+
+        results.append({
+            "id": m["id"],
+            "competition": comp.get("name"),
+            "start": start_date,
+            "status": status,
+            "home": home.get("name"),
+            "away": away.get("name"),
+            "home_rank": home_rank,
+            "away_rank": away_rank,
+            "home_points": home_points,
+            "away_points": away_points,
+            "lay_draw": "Oui" if lay_draw else "Non"
+        })
+    log("SYSTEM", f"✔ {len(results)} matchs validés")
+    return results
+
+# =========================
+# MAIN (PLAYWRIGHT + COOKIES AUTO)
+# =========================
+
+def send_to_sheets(df):
+    SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+    creds = Credentials.from_service_account_file(
+        "credentials.json",  # ton fichier téléchargé
+        scopes=SCOPES
+    )
+
+    client = gspread.authorize(creds)
+
+    # ton fichier
+    sheet = client.open_by_url(
+        "https://docs.google.com/spreadsheets/d/1a1iQ8Rq6wa3ECm84hVfVpIcoorgsCkiT5up06bk7gyw/edit"
+    )
+
+    worksheet = sheet.get_worksheet(0)  # ou .worksheet("nom")
+
+    worksheet.clear()
+
+    worksheet.update([df.columns.values.tolist()] + df.values.tolist())
+    
+async def main():
+    standings_cache.clear()
+    history_cache.clear()
+    async with async_playwright() as p:
+
+        browser = await p.chromium.launch(headless=True)
+
+        context = await browser.new_context()
+
+        # 🔥 IMPORTANT : initialise cookies automatiquement
+        page = await context.new_page()
+        await page.goto("https://www.sofascore.com", wait_until="domcontentloaded")
+        await page.wait_for_timeout(3000)
+        await page.close()
+
+        data = await process(context)
+        data.sort(key=lambda x: x["start"] or "")
+        df = pd.DataFrame(data)
+        df.to_csv("matches.csv", index=False)
+
+        print(f"✔ {len(df)} matchs exportés")
+        df = pd.DataFrame(data)
+        send_to_sheets(df)
+
+        await browser.close()
+
+
+asyncio.run(main())
