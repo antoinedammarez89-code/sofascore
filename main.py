@@ -13,16 +13,15 @@ DATE = datetime.now().strftime("%Y-%m-%d")  # auto (désactivé)
 LOG_FILE = f"logs_{DATE}.txt"
 
 def log(match_id, text):
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(f"{match_id} - {text}\n")
+    print(f"{match_id} - {text}")
 
 def exclude(home, away, reason, extra=None):
     match_name = f"{home} vs {away}"
 
     if extra:
-        log(match_name, f"❌ EXCLU : {reason} | {extra}")
+        print(f"{match_name} - ❌ EXCLU : {reason} | {extra}")
     else:
-        log(match_name, f"❌ EXCLU : {reason}")     
+        print(f"{match_name} - ❌ EXCLU : {reason}")
 
 
 standings_cache = {}
