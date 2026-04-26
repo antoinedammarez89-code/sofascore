@@ -193,6 +193,7 @@ async def get_season_id(context, comp_id):
 async def process(context):
 
     matches = await get_matches(context)
+    log("SYSTEM", f"🔄 START - {len(matches)} matchs récupérés")
     results = []
 
     for m in matches:
@@ -205,6 +206,7 @@ async def process(context):
             continue
 
         match_date = datetime.fromtimestamp(start_ts, tz=timezone.utc).strftime("%Y-%m-%d")
+        log("DEBUG", f"match_date={match_date} | expected={DATE}")
 
         if match_date != DATE:
             continue
@@ -237,6 +239,7 @@ async def process(context):
         home = m.get("homeTeam", {})
         away = m.get("awayTeam", {})
 
+        log("DEBUG", f"{home.get('name')} vs {away.get('name')}")
         home_id = home.get("id")
         away_id = away.get("id")
 
