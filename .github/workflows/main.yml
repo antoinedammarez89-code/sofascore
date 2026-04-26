@@ -27,6 +27,10 @@ jobs:
         run: |
           playwright install --with-deps
 
+      - name: Test Sofascore API
+        run: |
+          python -c "import requests; url='https://www.sofascore.com/api/v1/sport/football/scheduled-events/2026-04-27'; r=requests.get(url, headers={'User-Agent':'Mozilla/5.0'}); print('STATUS:', r.status_code); print('LEN:', len(r.text)); print(r.text[:500])"
+      
       - name: Run script
         env:
           GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
